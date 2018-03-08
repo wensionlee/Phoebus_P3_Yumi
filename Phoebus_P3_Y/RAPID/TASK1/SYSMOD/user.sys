@@ -1,0 +1,33 @@
+
+MODULE user (SYSMODULE)
+
+ ! Predefined user data
+ !*********************
+
+ ! Declaration of numeric registers reg1...reg5
+ VAR num reg1 := 0;
+ VAR num reg2 := 0;
+ VAR num reg3 := 0;
+ VAR num reg4 := 0;
+ VAR num reg5 := 0;
+
+ ! Declaration of stopwatch clock1
+ VAR clock clock1;
+CONST num ToolRightOffX:=0.3;
+CONST num ToolRightOffY:=0;
+CONST num ToolRightOffZ:=0;
+ !tool1:45degree
+ task PERS tooldata tool1 := [TRUE, [[0.212132,0.212132, 128], [0.92388, 0, 0, 0.382683]],
+                        [0.001, [0, 0, 0.001],[0.92388, 0, 0, 0.382683], 0, 0, 0]];
+ ! Template for declaration of workobject wobj1
+ !TASK PERS wobjdata wobj1 := [FALSE, TRUE, "", [[0, 0, 0],[1, 0, 0, 0]],[[0, 0, 0],[1, 0, 0, 0]]];
+!Base addition
+Pers wobjdata WobjRight:=[ FALSE, FALSE, "ROB_1", [ [0, 0, 0], [0.707107, 0, 0, 0.707107] ], [ [0, 0, 127], [0.92388, 0, 0, -0.382683] ] ];
+!0.92388, 0, 0 ,0.382683
+Pers wobjdata WobjLeft;
+PERS tooldata toolRighthand := [TRUE, [[0.212132,0.212132, 128], [0.270598, -0.653282, 0.270598, 0.653282] ], [0.001, [0, 0, 0.001], [1, 0, 0, 0], 0, 0, 0] ];   !cube permute tool parallel to WobjRight.
+!126.52
+
+PERS num RobState:=6;
+
+ENDMODULE

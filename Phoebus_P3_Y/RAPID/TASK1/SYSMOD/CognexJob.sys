@@ -1,0 +1,801 @@
+MODULE CognexJob(SYSMODULE)
+    ! By h46incon
+    ! There're lots of limitations in RAPID, so I have to make Cognex SpreadSheet adapt to here.
+    !
+    ! ---------------------------------------------------------------------------------------------------
+    !                                             USAGE
+    ! ---------------------------------------------------------------------------------------------------
+    !   User must be familiar with Cognex In Sight Explorer. And this driver communicate with Cognex
+    ! camera via socket using Native Mode Protocol. 
+    !   Driver supports job with multi tool. Each tool is defined as an operation that can return one
+    ! or many results. Result is a string and its format is defined by user. This driver has defined 
+    ! string format for object position with parse function. (See funtion usage)
+    !
+    !   Some tags must be defined in spreadsheet for each tool:
+    !     tool_name.IsPassed:   if the tool is passed
+    !     tool_name.DataNum:    Data number. Eg the number of objects bave been found
+    !     tool_name.Data1:      Datas. Eg the postion of each object. 
+    !     tool_name.Data2:
+    !     ....
+    !     tool_name.Datax:
+    !
+    !   User can use a CJ_Job object(record in RAPID) to describe a cognex job, and use a CJ_Tool to 
+    ! describe a tool. CJ_Tool has a filed named need_trigger to control the working state when triggering
+    ! a job.
+    !
+    !   Function usage:
+    !       1. Call cj_Init() to connect camera and do some initialization.
+    !       2. Set need_trigger filed to true of tool that need work.
+    !       3. Call cj_TriggerTools() to trigger. The result number is store in data_num filed of each toool.
+    !       4. Call cj_GetToolData() to get result. User must provide output buffer due to some RAPID 
+    !   limitations.
+    !       5. This driver has defined a string format for object position. And user can call parse function 
+    !   cj_StrToObjPos() to parse string into CJ_ObjPos. Each position is defined in format "X,Y,Angle"
+    !   (without quote), such as 11.1,22.2,33.3
+    !
+    !
+    ! 2015-09-18 First "commit" 
+    ! 2015-09-20 Finish tool's trigger.
+    ! 2015-09-22 Update "usage"
+    ! 2015-09-23 Add socket operation. Make driver indenpentdent. 
+    ! 2015-11-14 Multi tool enable tags support.
+    
+    ! ===================================================================
+    !                   PUBLIC DataType Define
+    ! ===================================================================
+    
+    RECORD CJ_Job
+        string ip_addr;         ! connect ip address
+        num port;
+        string user_name;       ! log in user name
+        string user_passwd;     
+        string job_name;        ! active job    
+        num max_trigger_time;   ! The Max waitting time[ms] for trigger complete when then camera is offline
+        
+        ! use an non-value data type in RAPID is suck. 
+        ! So I store socketdev (a non-value object) in a global array g_sockets, and index by cam_id;
+        ! User must make sure that the cam_id will not conflict. And the max ID value is the size of g_sockets.
+        ! // Comment write in the first line in a RECORD will make it becomes a non-value type! 
+        num cam_id;             ! camera ID. 
+        
+        !-------- Returned data --------------
+        bool is_passed;
+        bool is_online;
+    ENDRECORD
+    
+    RECORD CJ_ObjPos
+        num x;
+        num y;
+        num angle;
+    ENDRECORD
+
+    RECORD CJ_Tool
+        string enabled_tags;      ! tool chain's enabled tag for controlling the chain, Eg. "Tool1|Tool2"
+        string tool_name;
+        bool need_trigger;         ! if enabled when trigger the job.
+        
+        !---- Returned datas -----------
+        bool is_passed;
+        num data_num;
+        !num pass_count;
+    ENDRECORD
+    
+
+    ! ===================================================================
+    !                   LOCAL Define
+    ! ===================================================================
+    LOCAL VAR socketdev g_sockets{10};          ! if need more camera, just increase the size
+    
+    ! In RAPID, variable must be defined in header of module. So user can ignore this section.
+    LOCAL CONST string LOG_TAG          := "CognexJob: ";
+    
+    LOCAL CONST string TTag_is_passed   := "IsPassed";
+    LOCAL CONST string TTag_found_num   := "DataNum";
+    LOCAL CONST string TTag_datas_suffix  := "Data";
+    LOCAL CONST string TTag_enable_tag  := ".Tool_Enabled";
+    
+    LOCAL CONST string JTag_is_passed   := "Job.Pass";
+    LOCAL CONST string JTag_trigger     := "Acquisition.Trigger";
+    LOCAL CONST string JTag_time_stamp  := "Acquisition.Time_Stamp";
+    LOCAL CONST string JTag_job_count   := "Job.Inspection_Count";
+    LOCAL CONST string JTag_job_complete := "Job.Inspection_Completed";
+    LOCAL CONST num JTag_trigger_manul  := 3;
+    
+    LOCAL CONST string JCmd_set_online  := "SO1";
+    LOCAL CONST string JCmd_set_offline := "SO0";
+    LOCAL CONST string JCmd_send_event_and_wait  :=  "SW8";
+    LOCAL CONST string JCmd_send_event  :=  "SE8";
+    LOCAL CONST string JCmd_get_value   := "GV";
+    LOCAL CONST string JCmd_send_int    := "SI";
+    LOCAL CONST string JCmd_send_float  := "SF";
+    LOCAL CONST string JCmd_send_string := "SS";
+    LOCAL CONST string JCmd_get_file    := "GF";
+    LOCAL CONST string JCmd_load_file   := "LF";
+    
+    LOCAL CONST num CJ_ERROR_NUM        := -1.8534;     ! Just a random float number
+    LOCAL CONST num CMD_SUCCESS         := 1;
+    LOCAL CONST num CMD_UNRECOGNIZED    := 0;
+    
+    LOCAL CONST string STR_TERMINATOR   := "\0D\0A";
+    LOCAL CONST string STR_TERMINATOR_BEG   := "\0D";
+    LOCAL CONST string STR_TERMINATOR_END   := "\0A";
+    
+    LOCAL CONST num SOCK_CONN_WAIT_TIME := 5;
+
+
+    ! ===================================================================
+    !                   PUBLIC function
+    ! ===================================================================
+    PROC cj_InitCJToolRecord(INOUT CJ_Tool ptool)
+        ptool.data_num := 0;
+        ptool.is_passed := FALSE;
+    ENDPROC
+    
+    PROC cj_InitCJJobRecord(INOUT CJ_Job job)
+        job.is_passed := FALSE;
+        job.is_online := FALSE;
+    ENDPROC
+    
+    FUNC bool cj_Init(INOUT CJ_Job job, INOUT CJ_Tool ptools{*})
+        VAR bool success;
+        
+        ! Init job
+        success := cj_InitCamera(job);
+        IF NOT success THEN
+            RETURN FALSE;
+        ENDIF
+        
+        ! disable all tools
+        success := cj_SetToolsEnabledState(job, ptools, FALSE \check_trigger_flag:=FALSE);
+        
+        RETURN success;
+    ENDFUNC
+    
+    ! Trigger camera and run tools that tool.need_trigger is set to true
+    FUNC bool cj_TriggerTools(INOUT CJ_Job job, INOUT CJ_Tool ptools{*})
+        VAR bool success;
+        VAR num status;
+        VAR string str_received;
+        VAR num num_received;
+        
+        ! Enable tools
+        success := cj_SetToolsEnabledState(job, ptools, TRUE \check_trigger_flag:=TRUE);
+        ! ignore the returned result
+        
+        ! Trigger job
+        status := cj_TriggerJob(job);
+        IF NOT status = CMD_SUCCESS THEN
+            ! Disable tools
+            success := cj_SetToolsEnabledState(job, ptools, FALSE \check_trigger_flag:=TRUE);
+            RETURN FALSE;
+        ENDIF
+        
+        ! Update filed
+        ! Updata job filed
+        success := cj_GetValueToVar(job, JTag_is_passed, \bool_output:=job.is_passed);
+        ! Updata tools filed
+        success := cj_GetToolsState(job, ptools, \check_trigger_flag:=TRUE);
+        
+        ! Disable tools
+        success := cj_SetToolsEnabledState(job, ptools, FALSE \check_trigger_flag:=TRUE);
+        
+        RETURN TRUE;
+    ENDFUNC
+    
+    FUNC num cj_GetToolData(CJ_Job job, INOUT CJ_Tool ptool, 
+                INOUT string output{*}, \num beg_result_pos, \num max_data_len)
+        VAR bool success;
+        VAR num data_num;
+        VAR string tag;
+        VAR num beg_pos;
+        
+        ! Update job filed
+        success := cj_GetToolState(job, ptool);
+        
+        ! Check
+        IF NOT success THEN
+            TPWrite LOG_TAG + "Can not get tool's state, tool name: " + ptool.tool_name;
+            RETURN 0;
+        ENDIF
+        IF NOT ptool.is_passed THEN
+            TPWrite LOG_TAG + "Tool exec is not passed, tool name: " + ptool.tool_name;
+            RETURN 0;
+        ENDIF
+        
+        ! Get pos
+        IF Present(beg_result_pos) THEN 
+            beg_pos := beg_result_pos;
+        ELSE 
+            beg_pos := 1;
+        ENDIF
+        ! Get data num
+        data_num := ptool.data_num - beg_pos + 1;
+        IF data_num <= 0 THEN
+            RETURN 0;
+        ENDIF
+        IF Present(max_data_len) AND max_data_len < data_num THEN
+            data_num := max_data_len;
+        ENDIF
+        IF Dim(output, 1) < data_num THEN
+            data_num := Dim(output, 1);
+            TPWrite LOG_TAG + "output string is too small to hold the returned";
+        ENDIF
+        
+        ! Get datas
+        FOR i FROM beg_pos TO (beg_pos + data_num - 1) DO
+            tag := cj_GetToolTag(ptool,TTag_datas_suffix + ValToStr(i));
+            output{i - beg_pos + 1} := cj_GetValue(job, tag);
+        ENDFOR
+        
+        RETURN data_num;
+    ENDFUNC
+    
+    ! conevrt string to cj_ObjPos.
+    FUNC bool cj_StrToObjPos(string str, INOUT cj_ObjPos obj_pos)
+        VAR num str_len;
+        VAR num comma_pos{2};
+        VAR string filed_str{3};
+        VAR bool success{3};
+        
+        str_len := StrLen(str);
+        ! Find comma position
+        comma_pos{1} := StrMatch(str, 1, ",");
+        IF comma_pos{1} >= str_len THEN 
+            TPWrite LOG_TAG + "Wrong format string";
+            RETURN FALSE;
+        ENDIF
+        
+        comma_pos{2} := StrMatch(str, comma_pos{1} + 1, ",");
+        IF comma_pos{2} > str_len THEN 
+            TPWrite LOG_TAG + "Wrong format string";
+            RETURN FALSE;
+        ENDIF
+        
+        ! Split 
+        filed_str{1} := StrPart(str, 1, comma_pos{1} - 1);
+        filed_str{2} := StrPart(str, comma_pos{1} + 1, comma_pos{2} - comma_pos{1} - 1);
+        filed_str{3} := StrPart(str, comma_pos{2} + 1, str_len - comma_pos{2});
+        
+        ! convert to number
+        success := [
+            StrToVal(filed_str{1}, obj_pos.x),
+            StrToVal(filed_str{2}, obj_pos.y),
+            StrToVal(filed_str{3}, obj_pos.angle)
+            ];
+            
+        RETURN success = [TRUE, TRUE, TRUE];
+    ENDFUNC
+    
+    ! ===================================================================
+    !                   LOCAL function
+    ! ===================================================================
+    
+    ! ----------- Comm  ---------------------------------
+    LOCAL FUNC string cj_StrRightPart(string str, num len)
+        VAR num str_len;
+
+        str_len := StrLen(str);
+        IF len > str_len THEN
+            RETURN "";
+        ELSE 
+            RETURN StrPart(str, str_len-len+1, len);
+        ENDIF
+    ENDFUNC
+    
+    LOCAL FUNC string cj_StrSplit(string str, string pattern, num beg_index, \INOUT num end_index)
+        VAR num pat_i;
+        VAR num end_index_ret;
+        VAR string str_ret;
+        VAR num str_len;
+        VAR num pat_len;
+        
+        str_len := StrLen(str);
+        IF beg_index > str_len THEN
+            ! beg_index is error 
+            end_index_ret := beg_index;
+            str_ret := stEmpty;
+            
+        ELSE
+            pat_i := StrMatch(str, beg_index, pattern);
+            pat_len := StrLen(pattern);
+            
+            IF pat_i = beg_index THEN
+                ! pattern is in beginning
+                str_ret := stEmpty;
+                end_index_ret := beg_index + pat_len;
+                
+            ELSEIF pat_i > str_len THEN
+                ! not pattern found, return all remain string
+                str_ret := StrPart(str, beg_index, str_len - beg_index + 1);
+                end_index_ret := pat_i;
+                
+            ELSE
+                ! normal process
+                str_ret := StrPart(str, beg_index, pat_i - beg_index);
+                end_index_ret := pat_i + pat_len;
+            ENDIF
+        ENDIF
+        
+        IF Present(end_index) THEN
+            end_index := end_index_ret;
+        ENDIF
+        RETURN str_ret;
+        
+    ENDFUNC
+        
+    LOCAL FUNC string cj_GetToolTag(CJ_Tool ptool, string t_tag)
+        RETURN ptool.tool_name + "." + t_tag;
+    ENDFUNC
+    
+    ! This function will connect to camare, load job, set trigger to MANUL, and set it online
+    LOCAL FUNC bool cj_InitCamera(INOUT CJ_Job job)
+        CONST num simple_cmd_wait := 100;   ! wait respond for 100ms for simple command
+        VAR num status;
+        VAR string cmd;
+        VAR bool b_result;
+        
+        ! Login
+        b_result := cj_Login(job);
+        ! Check if connected successfully
+        IF NOT b_result = TRUE THEN
+            RETURN FALSE;
+        ENDIF
+        
+        ! LOAD job
+        status := cj_LoadJobIfNecessary (job);
+        IF NOT status = CMD_SUCCESS THEN
+            RETURN FALSE;
+        ENDIF
+        
+        ! Set trigger to MANUL
+        cmd := cj_GetSendIntCMD(JTag_trigger, JTag_trigger_manul);
+        status := cj_SendStr(job, cmd);
+        IF NOT status = CMD_SUCCESS THEN
+            job.is_online := FALSE;
+            RETURN TRUE;
+        ENDIF
+        
+        ! Set Online
+        status := cj_SendStr(job, JCmd_set_online);
+        IF status = CMD_SUCCESS THEN
+            job.is_online := TRUE;
+        ELSE
+            job.is_online := FALSE;
+        ENDIF
+            
+        RETURN TRUE;
+    ENDFUNC
+    
+    ! ----------- socket operation  ---------------------
+    ! connect socket, and login camera
+    LOCAL FUNC bool cj_Login(CJ_Job job)
+        VAR bool b_result;
+        VAR string str_rec;
+        VAR string str_send;
+        CONST num wait_time := 0.1;     ! wait time for received
+        
+        ! disconnect socket 
+        IF NOT (SocketGetStatus(g_sockets{job.cam_id}) = SOCKET_CLOSED) THEN
+            b_result := cj_Disconnect(job);
+        ENDIF
+        ! Create socket
+        SocketCreate g_sockets{job.cam_id};
+        IF NOT SocketGetStatus(g_sockets{job.cam_id}) = SOCKET_CREATED THEN
+            TPWrite LOG_TAG + "Create socket failed, job name: " + job.job_name;
+            RETURN FALSE;
+        ENDIF
+        ! Connect socket
+        SocketConnect g_sockets{job.cam_id}, job.ip_addr, job.port, \Time:=SOCK_CONN_WAIT_TIME;
+        IF NOT SocketGetStatus(g_sockets{job.cam_id})=SOCKET_CONNECTED THEN
+            TPWrite LOG_TAG + "Connect socket failed, job name: " + job.job_name;
+            RETURN FALSE;
+        ENDIF
+        
+        ! Login
+        WaitTime wait_time;
+        SocketReceive g_sockets{job.cam_id}, \Str:=str_rec;
+        !check, that last 6 characters are "User: "
+        str_rec := cj_StrRightPart(str_rec,6);
+        IF NOT str_rec = "User: " THEN
+            TPWrite LOG_TAG + "Vision Login Warning (User Prompt)";
+            ! but continue login
+        ENDIF
+        
+        ! Send the Username
+        str_send := job.user_name + STR_TERMINATOR;
+        SocketSend g_sockets{job.cam_id}, \Str:=str_send;
+        WaitTime wait_time;
+        SocketReceive g_sockets{job.cam_id}, \Str:=str_rec;
+        IF NOT str_rec = "Password: " THEN
+            TPWrite LOG_TAG + "Vision Login Warning (Password Prompt)";
+            ! but continue login
+        ENDIF
+        
+        ! Send Password
+        str_send := job.user_passwd + STR_TERMINATOR;
+        SocketSend g_sockets{job.cam_id}, \Str:=str_send;
+        WaitTime wait_time;
+        SocketReceive g_sockets{job.cam_id}, \Str:=str_rec;
+        
+        IF str_rec = ("User Logged In" + STR_TERMINATOR) THEN
+            RETURN TRUE;
+        ELSE 
+            TPWrite LOG_TAG + "Vision Login Error (Final Login)";
+            RETURN FALSE;
+        ENDIF
+        
+    ERROR
+        IF ERRNO = ERR_SOCK_TIMEOUT THEN
+            TPWrite LOG_TAG + "ERRNO = 1093 / ERR_SOCK_TIMEOUT";
+            TRYNEXT;
+        ELSE
+            TPWrite LOG_TAG + "ERRNO = "+ValToStr(ERRNO);
+        ENDIF
+        RETURN FALSE;
+    ENDFUNC
+    
+    LOCAL FUNC bool cj_Disconnect(CJ_Job job)
+        IF SocketGetStatus(g_sockets{job.cam_id})<>SOCKET_CLOSED THEN
+            !WaitTime 1;
+            SocketClose g_sockets{job.cam_id};
+        ENDIF
+        ERROR
+            RETURN TRUE;
+    ENDFUNC
+    
+    ! send data, and read received data.
+    LOCAL FUNC bool cj_SendReceive(CJ_Job job ,num delay_ms, num try_times, 
+                string str_send, INOUT string str_received)
+        VAR num n_status;
+        VAR num tried_times := 0;
+        VAR bool result;
+        
+        WHILE TRUE DO
+            str_received := stEmpty;
+            
+            SocketSend g_sockets{job.cam_id} \Str:=str_send;
+            WaitTime (delay_ms+50) / 1000;
+            ! Read data
+            SocketReceive g_sockets{job.cam_id} \Str:=str_received;
+            n_status := cj_ExtraStatus(str_received);
+          	
+            ! Check if success
+            IF (NOT n_status = CJ_ERROR_NUM) AND (n_status > 0) THEN
+                RETURN TRUE;
+            ENDIF
+            
+            ! Check if can retry
+            tried_times := tried_times + 1;
+            IF tried_times >= try_times THEN
+                IF NOT (n_status = CJ_ERROR_NUM) THEN
+                    RETURN TRUE;
+                ELSE
+                    RETURN FALSE;
+                ENDIF
+            ELSE
+                WaitTime 0.1;
+            ENDIF
+        ENDWHILE
+        
+    ERROR
+        !!PulseDo \High\PLength:=5,oStopMultitask;
+        IF ERRNO = ERR_SOCK_TIMEOUT THEN
+            !1093
+            TPWrite LOG_TAG + "ERRNO = 1093 / ERR_SOCK_TIMEOUT";
+            IF RemainingRetries()>0 THEN
+                RETRY;
+            ENDIF
+        ELSEIF ERRNO = ERR_SOCK_CLOSED THEN
+            !1094
+            TPWrite LOG_TAG + "ERRNO = 1094 / ERR_SOCK_CLOSED";
+            IF RemainingRetries() > 0 THEN
+                TPWrite LOG_TAG + "Retry to Reconnect";
+                result := cj_Disconnect(job);
+                result := cj_Login(job);
+                RETRY;
+            ELSE
+                TPWrite LOG_TAG + "No more retries to Reconnect";
+            ENDIF
+        ELSE
+            TPWrite LOG_TAG + "ERRNO = " + ValToStr(ERRNO);
+        ENDIF
+        RETURN FALSE;
+    ENDFUNC
+
+    ! ----------- protocol handle ---------------------
+    !Extract the data from received string, removing the status code and tailing "\0D\0A" 
+    LOCAL FUNC string cj_ExtraData(string str_received)   
+        VAR num str_len;
+        VAR num start_pos;
+        VAR num end_pos;
+ 
+        str_len := strlen(str_received);
+        start_pos := StrMatch(str_received, 1, STR_TERMINATOR_END) + 1;
+        end_pos := StrMatch(str_received, start_pos, STR_TERMINATOR_BEG);
+        return Strpart(str_received, start_pos, end_pos - start_pos); 
+    ENDFUNC
+    
+    ! Extract the status code from received string
+    LOCAL FUNC num cj_ExtraStatus(string str_received)           
+        CONST num start_pos := 1;
+        VAR num end_pos;
+        VAR string status_str;
+        VAR num status_num;
+        
+        end_pos := StrMatch(str_received, start_pos, STR_TERMINATOR_BEG); 
+        status_str := StrPart(str_received, start_pos, end_pos-1);
+                
+        IF StrToVal(status_str, status_num)=TRUE THEN
+            RETURN status_num;
+        ELSE
+            RETURN CJ_ERROR_NUM;
+        ENDIF
+        
+    ENDFUNC
+
+    LOCAL FUNC string cj_GetSendIntCMD(string tag, num val)
+!        TryInt val; 
+!            RETURN JCmd_send_int + tag + " " + ValToStr(val);
+!        ERROR
+!            TPWrite LOG_TAG + "Number " + ValToStr(val) + " is not an integer";
+!            RETURN "";
+        ! The ERROR Handle can only run in motion task.
+        RETURN JCmd_send_int + tag + " " + ValToStr(val);
+    ENDFUNC
+    
+    LOCAL FUNC string cj_GetSendFloatCMD(string tag, num val)
+        RETURN JCmd_send_float + tag + " " + ValToStr(val);
+    ENDFUNC
+    
+    LOCAL FUNC string cj_GetSendStringCMD(string tag, string val)
+        RETURN JCmd_send_string + tag + " " + val;
+    ENDFUNC
+    
+    ! Get value of tag
+    LOCAL FUNC string cj_GetValue(CJ_Job job, string tag, \INOUT num status)
+        VAR string str_rec;
+        VAR num mstatus;
+        VAR string cmd;
+        
+        cmd := JCmd_get_value + tag;
+        mstatus := cj_SendStr(job, cmd, \data_received:=str_rec);
+        
+        IF Present(status) THEN
+            status := mstatus;
+        ENDIF
+        RETURN str_rec;
+    ENDFUNC
+    
+    ! Get value of a tag, and store to output
+    LOCAL FUNC bool cj_GetValueToVar(CJ_Job job, string tag, 
+                \INOUT num num_output, \INOUT bool bool_output)
+        VAR string str_rec;
+        VAR num status;        
+        VAR num output;
+
+        str_rec := cj_GetValue(job, tag, \status:=status);
+        
+        IF status = CMD_SUCCESS AND StrToVal(str_rec, output) THEN
+            ! store to output
+            IF Present(num_output) THEN
+                num_output := output;
+            ENDIF
+            
+            IF Present(bool_output) THEN
+                bool_output := (output = 1);
+            ENDIF
+            
+            RETURN TRUE;
+        ELSE
+            TPWrite LOG_TAG + "Could not get value of tag: " + tag;
+            RETURN FALSE;
+        ENDIF
+        
+        
+    ENDFUNC
+    
+    ! Send string to camera. This function will add tailing "\0D\0A"
+    LOCAL FUNC num cj_SendStr(
+                    CJ_Job job, string str, 
+                    \INOUT string data_received,
+                    \num wait_time_ms, \num try_times
+                )
+        CONST num DEFAULT_WAIT_TIME := 50;
+        CONST num DEFAULT_TRY_TIMIES := 2;
+        VAR string non_used;
+        VAR num status_num;
+        VAR string str_received;
+        VAR num a_wait_time_ms := DEFAULT_WAIT_TIME;
+        VAR num a_try_times := DEFAULT_TRY_TIMIES;
+        VAR bool success;
+        
+        ! Handle default param
+        IF Present(wait_time_ms) THEN
+            a_wait_time_ms := wait_time_ms;
+        ENDIF
+        IF Present(try_times) THEN
+            a_try_times := try_times;
+        ENDIF
+        
+        success := cj_SendReceive(job, a_wait_time_ms, a_try_times, str + STR_TERMINATOR, str_received);
+        IF NOT success THEN
+            RETURN CJ_ERROR_NUM;
+        ENDIF
+        IF Present(data_received) THEN
+            data_received := cj_ExtraData(str_received);
+        ENDIF
+        RETURN cj_ExtraStatus(str_received);
+    ENDFUNC
+         
+    ! -------------- Job handler ------------------
+    LOCAL FUNC string cj_GetCurrentJob(CJ_Job job)
+        VAR num status;
+        VAR string data_rec;
+        
+        status := cj_SendStr(job, JCmd_get_file, \data_received:=data_rec);
+        IF status = CMD_SUCCESS THEN
+            RETURN data_rec;
+        ELSE
+            RETURN "";
+        ENDIF
+        
+    ENDFUNC
+    
+    LOCAL FUNC num cj_LoadJob(CJ_Job job)
+        RETURN cj_SendStr(job, JCmd_load_file + job.job_name);
+    ENDFUNC
+    
+    LOCAL FUNC num cj_LoadJobIfNecessary(CJ_Job job)
+        VAR string cur_job;
+        VAR num status;
+        VAR string target_job;
+        
+        ! Get current job
+        cur_job := cj_GetCurrentJob(job);
+        
+        ! compare
+        cur_job := StrMap(cur_job, STR_LOWER, STR_UPPER);
+        target_job := StrMap(job.job_name, STR_LOWER, STR_UPPER);
+        IF cur_job = target_job THEN
+            RETURN CMD_SUCCESS;
+        ELSE
+            RETURN cj_LoadJob(job);
+        ENDIF
+    ENDFUNC
+    
+    ! Trigger the camera
+    LOCAL FUNC num cj_TriggerJob(CJ_Job job)
+        VAR num status;
+        VAR bool result;
+        VAR num complete_flag_back;
+        VAR num complete_flag;
+        
+        IF job.is_online THEN
+            RETURN cj_SendStr(job, JCmd_send_event_and_wait);
+        ELSE
+            ! Read complete_flag
+            result := cj_GetValueToVar(job, JTag_job_complete, \num_output:=complete_flag_back);
+            status := cj_SendStr(job, JCmd_send_event, \try_times:=1);
+            IF status = CMD_SUCCESS THEN
+                ! Wait to complete
+                WHILE TRUE DO
+                    result := cj_GetValueToVar(job, JTag_job_complete, \num_output:=complete_flag);
+                    IF NOT complete_flag_back = complete_flag THEN
+                        RETURN CMD_SUCCESS;
+                    ELSE
+                        !WaitTime 0.2;
+                    ENDIF
+                ENDWHILE
+            ELSE
+                RETURN status;
+            ENDIF
+        ENDIF
+    ENDFUNC
+    
+    ! --------------- Tool Handler -----------------------
+    ! Set tools enabled_status, if state is true then able, else disable.
+    LOCAL FUNC bool cj_SetToolEnabledState(CJ_Job job, CJ_Tool mtool, bool state)
+        VAR num state_v;
+        VAR string cmd;
+        VAR num cmd_ret;
+        VAR bool success;
+        VAR num tag_i;
+        VAR string tag;
+        VAR num tags_len;
+        
+        ! Init var
+        IF state THEN
+            state_v := 1;
+        ELSE
+            state_v := 0;
+        ENDIF
+        tags_len := StrLen(mtool.enabled_tags);
+        tag_i := 1;
+        success := TRUE;
+        
+        ! Loop for each tag
+        WHILE TRUE DO
+            ! get each tag
+            tag := cj_StrSplit(mtool.enabled_tags, "|", tag_i, \end_index := tag_i);
+            
+            ! set state of tag
+            IF NOT tag = stEmpty THEN 
+                tag := tag + TTag_enable_tag;
+                cmd := cj_GetSendIntCMD(tag, state_v);
+                cmd_ret := cj_SendStr(job, cmd);
+                IF NOT cmd_ret = CMD_SUCCESS THEN
+                    success := FALSE;
+                ENDIF
+            ENDIF
+            
+            ! Check If end
+            IF tag_i > tags_len THEN
+                RETURN success;
+            ENDIF
+        ENDWHILE
+    ENDFUNC
+    
+    ! Set tools enabled status, return true if operations of all tools is successful.
+    ! If check_enable_flag is set to ture, is will only set its status only when tool.need_trigger is true.
+    LOCAL FUNC bool cj_SetToolsEnabledState(CJ_Job job, CJ_Tool mtool{*}, bool state, \bool check_trigger_flag)
+        VAR bool success := TRUE;
+        VAR bool need_check_flag := FALSE;
+        
+        ! If need check?
+        IF Present(check_trigger_flag) AND check_trigger_flag = TRUE THEN
+            need_check_flag := TRUE;
+        ENDIF
+        
+        ! Do operations
+        FOR i FROM 1 TO Dim(mtool, 1) DO
+            IF (NOT need_check_flag) OR mtool{i}.need_trigger THEN
+                success := cj_SetToolEnabledState(job, mtool{i}, state) 
+                                AND success;
+            ENDIF
+        ENDFOR
+
+        RETURN success;
+    ENDFUNC
+    
+    ! Get tool's state, such as is_passed and found_num
+    LOCAL FUNC bool cj_GetToolState(CJ_Job job, INOUT CJ_Tool ptool)
+        VAR num val;
+        VAR bool success := TRUE;
+        VAR string tag_name;
+        
+        ! Get is_passed tag
+        tag_name := cj_GetToolTag(ptool, TTag_is_passed);
+        success := cj_GetValueToVar(job, tag_name , \bool_output:=ptool.is_passed) 
+                        AND success;
+
+        ! Get found_num
+        tag_name := cj_GetToolTag(ptool, TTag_found_num);
+        success := cj_GetValueToVar(job, tag_name, \num_output:=ptool.data_num)
+                        AND success;
+        
+        RETURN success;
+    ENDFUNC
+    
+    ! Get tools's state, such as is_passed and found_num
+    ! If check_enable_flag is set to ture, is will only set its status only when tool.need_trigger is true.
+    LOCAL FUNC bool cj_GetToolsState(CJ_Job job, CJ_Tool mtool{*}, \bool check_trigger_flag)
+        VAR bool success := TRUE;
+        VAR bool need_check_flag := FALSE;
+        
+        ! If need check?
+        IF Present(check_trigger_flag) AND check_trigger_flag = TRUE THEN
+            need_check_flag := TRUE;
+        ENDIF
+        
+        ! Do operations
+        FOR i FROM 1 TO Dim(mtool, 1) DO
+            IF (NOT need_check_flag) OR mtool{i}.need_trigger THEN
+                success := cj_GetToolState(job, mtool{i})
+                                AND success;
+            ENDIF
+        ENDFOR
+
+        RETURN success;
+    ENDFUNC
+    
+ENDMODULE

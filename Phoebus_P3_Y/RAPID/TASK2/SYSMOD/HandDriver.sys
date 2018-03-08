@@ -1,0 +1,834 @@
+MODULE HandDriver(SYSMODULE)
+
+! This file provides driver function and interface to operate the Hand via RAPID programming.
+! This driver is based on the work of Per Nylen and Jonas Haulin(Asimov_Hand_v5_3_Driver.mod).
+
+! *******************************************************
+! FILE      HandDriver.sys
+! AUTHOR    Wenlong Li, Songlin Cai
+! REVISION  0.1
+! History
+!	2013.11.1	Created by Wenlong Li
+!	2013.11.18	Modified by Wenlong Li
+!				 - Rename the file, and improve the ident format.
+!				 - Improve the Hand_Initialize process.
+!				 - Fix the bug when do jogging.
+!				 - Add WaitTime in DoCalibrate.
+!				 - Add NoWait Option to PROC MoveInward, MoveOutward, MoveTo.
+!				 - Add proc: WaitActionCompleted.
+!				 - Add proc: GripTo (num targetPos, \ num expectedForce)
+!				 - Book errnum ERR_HAND_WRONG_STATE, which indicates a failure when wait for expected state of hand.
+!				 - Book errnum ERR_HAND_NOTCALIBRATED, which indicates the hand is not calibrated.
+!				 - Add ERR_HAND_WRONG_STATE raise and handler in Hand_WaitForExpectedState.
+!				 - FUNC HAND_IsCalibrated() now could pop a ERR_HAND_NOTCALIBRATED error optionlly, which will lead to a program stop with tpwrite.
+!				 - Add checking calibration status in all Move and Grip routine.
+!	2013.11.21	Modified by Wenlong Li
+!				 - Add routine descriptions.
+!				 - Book errnum ERR_HAND_NOHAND, which indicates that no hand is detected.
+!				 - Add feature to automatically identify whether the master robot is Asimov or no in PROC Hand_SetupChirality().
+!				 - Add feature to automatically identify hand chirality when used in lonely 6-axis robot in PROC Hand_SetupChirality().
+!				 - Add feature to detect whether a hand is available by check the communication status in PROC Hand_SetupChirality() for Both Asimov and non Asimov.
+!	2013.11.29	Modified by Wenlong Li
+!				 - Fix bugs in FUNC bool Hand_isCalibrated() which will never execute TPWrite.
+!	2013.12.5	Modified by Wenlong Li
+!				 - Add force setting in Hand_Initialize.
+!	2013.12.9	Modified by Wenlong Li
+!				 - Change the file descriptions. (Especially, Hand_GripTo is not recommended any more.)
+!				 - Improve the robustness of Hand_MoveTo and Hand_GripTo routines(restore the Max/Min pos value at the end of these routines).
+!				 - Change some TPWrite for better debug.
+!				 - Improve the robustness of free moving functions, by increasing the allowed finger positioning error on RAPID side, or RETRY.
+!   2013.12.24  Modified by Song Lin Cai
+!                -Add some server routines for communicating with GTPU app with affix of Server
+
+! *******************************************************
+
+
+! **************************************************** Usage description ****************************************************
+! It's strongly recommended to use only the following proc/func in your code for robustness and easy code maintenance
+!
+!	Basic operations:
+!		(1)	PROC Hand_Initialize (\num maxSpd, \num maxPos, \num minPos, \num physicalMaxPos, \switch Calibrate)
+!
+!		(2)	FUNC bool Hand_IsCalibrated ( \switch RaiseErr)
+!
+!		(3)	PROC Hand_JogInward()
+!
+!		(4)	PROC Hand_JogOutward()
+!
+!		(5)	PROC Hand_MoveTo (num targetPos \switch NoWait)
+!
+!		(6)	PROC Hand_GripInward(\ num targetPosition, \ num expectedForce)
+!
+!		(6)	PROC Hand_GripOutward(\ num targetPosition, \ num expectedForce)
+!
+!		(8)	PROC Hand_BlowOnCup1 ()
+!
+!		(9)	PROC Hand_BlowOnCup2 ()
+!
+!		(10)	PROC Hand_VacuumOnCup1 ()
+!
+!		(11)PROC Hand_VacuumOnCup2 ()
+!
+!		(12)PROC Hand_Stop ()
+!
+!		(13)PROC Hand_WaitActionCompleted ()
+!
+!
+!	Advanced operations:
+!		(1)FUNC num Hand_GetActualPos ()
+!
+!		(2)FUNC num Hand_GetFingerState ()
+!
+!
+!
+! **************************************************** End of description ****************************************************
+
+
+TASK VAR errnum ERR_HAND_WRONG_STATE := -1;
+TASK VAR errnum ERR_HAND_NOTCALIBRATED := -1;
+TASK VAR errnum ERR_HAND_NOHAND := -1;
+
+
+LOCAL CONST num MAX_WAIT_DURATION := 5;
+LOCAL CONST num MAX_JOG_TIME := 5;
+
+
+! constants indicating the commands for the hand
+LOCAL CONST num COMMAND_JOGOPEN := 1;
+LOCAL CONST num COMMAND_JOGCLOSE := 2;
+LOCAL CONST num COMMAND_FREEMOVETOMAXPOS := 3;
+LOCAL CONST num COMMAND_FREEMOVETOMINPOS := 4;
+LOCAL CONST num COMMAND_GRIPOUTWARDIN := 5;
+LOCAL CONST num COMMAND_GRIPINWARDOUT := 6;
+LOCAL CONST num COMMAND_FORCINGOUTWARDIN := 7;
+LOCAL CONST num COMMAND_FORCINGINWARDOUT := 8;
+LOCAL CONST num COMMAND_GOTOERROR := 9;
+LOCAL CONST num COMMAND_GOTOREADY := 10 ;
+LOCAL CONST num COMMAND_GOTOCALIBRATION := 11;	
+
+!Constants indicating the states of the hand
+LOCAL CONST num STATE_READY := 0;
+LOCAL CONST num STATE_ERROR := 1;
+LOCAL CONST num STATE_FREEMOVETOMAXPOS := 2;
+LOCAL CONST num STATE_FREEMOVETOMINPOS := 3;
+LOCAL CONST num STATE_GRIPMOVEOUTWARDIN := 4;
+LOCAL CONST num STATE_GRIPMOVEINWARDOUT := 5;
+LOCAL CONST num STATE_ACTIONCOMPLETED := 6;
+LOCAL CONST num STATE_GRIPFORCINGOUTWARDIN := 7;
+LOCAL CONST num STATE_GRIPFORCINGINWARDOUT := 8;
+LOCAL CONST num STATE_KEEPOBJECT := 9;
+LOCAL CONST num STATE_CALIBRATION := 10;
+LOCAL CONST num STATE_JOGOPEN := 11;
+LOCAL CONST num STATE_JOGCLOSE := 12;
+
+!Constants for Hand's property
+LOCAL CONST num DEFAULT_MAXPOSITION := 200;
+LOCAL CONST num DEFAULT_MINPOSITION := 20;
+LOCAL CONST num DEFAULT_MAXSPEED := 200;
+LOCAL CONST num DEFAULT_HOLDFORCE := 200;
+
+!individual property of Asimov Hand
+LOCAL PERS num hand_PhysicalMaxPosition:=247;
+LOCAL PERS num hand_DefaultJogtime:=2.5;
+LOCAL PERS string hand_Chirality:="LEFT";
+LOCAL VAR bool hand_IsChiralityDefined:=False;
+
+
+! Signals definitions to control fingers.
+!Group Input Signal Settings
+LOCAL VAR signalgi hand_ActualPosition;
+LOCAL VAR signalgi hand_ActualSpeed;
+LOCAL VAR signalgi hand_ActualForce;
+LOCAL VAR signalgi hand_FingerState;
+LOCAL VAR signalgi hand_FingerError;
+LOCAL VAR signalgi hand_SoftwareVersion;
+!Group Output Signal Settings
+LOCAL VAR signalgo hand_FingerCommand;
+LOCAL VAR signalgo hand_MaxPosition;
+LOCAL VAR signalgo hand_MinPosition;
+LOCAL VAR signalgo hand_MaxSpeed;
+LOCAL VAR signalgo hand_HoldForce;
+!Digital Input Signal Settings
+LOCAL VAR signaldi hand_Calibrated;
+!Digital Output Signal Settings
+LOCAL VAR signaldo hand_ClearError;
+
+! Signal definition to control valves.
+! DO for control
+LOCAL VAR signaldo cupCtrl_SucTool1;
+LOCAL VAR signaldo cupCtrl_SucTool2;
+LOCAL VAR signaldo cupCtrl_BlowTool1;
+LOCAL VAR signaldo cupCtrl_BlowTool2;
+! DI as feedbsck.
+LOCAL VAR signaldi cupStatus_SucTool1;
+LOCAL VAR signaldi cupStatus_SucTool2;
+LOCAL VAR signaldi cupStatus_BlowTool1;
+LOCAL VAR signaldi cupStatus_BlowTool2;
+
+!**************************************************!
+!----------GTPU server routine start---------------!
+PROC HandCalibrateServer()
+   var num maxpos;
+   VAR num minpos;
+   VAR num maxspd;
+   VAR num holdforce;
+   Hand_SetupChirality;
+   maxpos:=GOutput(hand_MaxPosition);
+   minpos:=GOutput(hand_MinPosition);
+   maxspd:=GOutput(hand_MaxSpeed);
+   holdforce:=GOutput(hand_HoldForce);
+   IF maxpos<1 THEN
+       maxpos:=200;
+   endif
+    IF minpos<1 THEN
+       minpos:=120;
+   endif
+    IF maxspd<1 THEN
+       maxspd:=250;
+   endif
+    IF holdforce<1 THEN
+       holdforce:=150;
+   endif
+Hand_SetMaxPosition maxpos;
+Hand_SetMinPosition minpos;
+Hand_SetMaxSpeed maxspd;
+Hand_SetHoldForce holdforce;    
+Hand_DoCalibrate;
+ENDPROC 
+
+PROC HandJogOutServer()
+    Hand_JogOutward;
+ENDPROC
+
+PROC HandJogInServer()
+    Hand_JogInward;
+ENDPROC
+
+PROC HandMoveOutServer()
+    Hand_MoveOutward;
+ENDPROC 
+
+PROC HandMoveInServer()
+     Hand_MoveInward;
+ENDPROC
+
+PROC HandGripOutServer()
+   Hand_GripOutward; 
+ENDPROC 
+
+PROC HandGripInServer()
+    Hand_GripInward; 
+ENDPROC 
+
+PROC HandStopServer()
+  Hand_Stop;  
+ENDPROC 
+!------------GTPU server routine end---------------!
+!**************************************************!
+
+! Init the hand with default parameters
+PROC Hand_InitDefaultParas ()
+Hand_SetMaxSpeed 250;
+Hand_SetMaxPosition 120;
+Hand_SetMinPosition 30;
+Hand_SetHoldForce 150;
+ENDPROC
+
+
+! Init the hand with typical parameters.
+PROC Hand_Initialize (\num maxSpd, \num maxPos, \num minPos, \num holdForce, \num physicalMaxPos, \switch Calibrate)
+! Set with default paras.
+Hand_InitDefaultParas;
+
+! Update the paras with the optional assignments.
+IF Present(maxSpd) THEN
+	Hand_SetMaxSpeed maxSpd;
+ENDIF
+
+IF Present(maxPos) THEN
+	Hand_SetMaxPosition maxPos;
+ENDIF
+
+IF Present(minPos) THEN
+	Hand_SetMinPosition minPos;
+ENDIF
+
+IF Present (holdForce) THEN
+	Hand_SetHoldForce holdForce;
+ENDIF
+
+IF Present(physicalMaxPos) THEN
+
+ENDIF
+
+IF Present(Calibrate) THEN
+Hand_DoCalibrate;
+ENDIF
+
+ENDPROC
+
+PROC Hand_WaitForExpectedState (num expectedState, \num alternativeState, \num duration )
+VAR bool bIsTimeOut := FALSE;
+VAR string dir;
+VAR string sOriginSignName;
+VAR signalgo signal_TargetPos;
+VAR num nTotalRetryNum;
+
+ReadCfgData "/SYS/SYS_MISC/NoOfRetry","Value", nTotalRetryNum;
+
+IF Present(alternativeState) THEN
+	IF Present(duration) THEN
+		WaitUntil (Hand_GetFingerState() = expectedState OR Hand_GetFingerState() = alternativeState), \MaxTime := duration, \TimeFlag := bIsTimeOut;
+	ELSE 
+		WaitUntil (Hand_GetFingerState() = expectedState OR Hand_GetFingerState() = alternativeState), \MaxTime := MAX_WAIT_DURATION \TimeFlag := bIsTimeOut;
+	ENDIF
+ELSE 
+	IF Present(duration) THEN
+		WaitUntil (Hand_GetFingerState() = expectedState ), \MaxTime := duration, \TimeFlag := bIsTimeOut;
+	ELSE 
+		WaitUntil (Hand_GetFingerState() = expectedState ), \MaxTime := MAX_WAIT_DURATION, \TimeFlag := bIsTimeOut;
+	ENDIF
+ENDIF
+
+IF bIsTimeOut = TRUE THEN
+	! Raise the custom error.
+	IF expectedState = STATE_ACTIONCOMPLETED THEN
+	ENDIF
+	RAISE ERR_HAND_WRONG_STATE;
+ENDIF
+
+ERROR
+IF ERRNO = ERR_HAND_WRONG_STATE THEN
+	! Determine whether the hand is waiting for ActionCompleted state after moving action.
+	IF expectedState=STATE_ACTIONCOMPLETED AND ( GOutput(hand_FingerCommand)>=3 AND GOutput(hand_FingerCommand)<= 6) THEN
+		IF GOutput(hand_FingerCommand) = 4 OR GOutput(hand_FingerCommand) = 5 THEN
+			dir := "Min";
+		ELSE
+			dir := "Max";
+		ENDIF
+		sOriginSignName := dir + "_Position_" + hand_Chirality;
+		AliasIO sOriginSignName, signal_TargetPos;
+		
+		! If the positioning error is smaller than the allowed, igore this error.
+		IF Abs(Hand_GetActualPos()-GOutput(signal_TargetPos))<3 THEN
+			TPWrite hand_Chirality + " hand: minor positioning error ignored.";
+			RETURN;
+		! Elsely, try again. (According to test, Hand 3 will sometimes complete the gripping moving so slowly that 5s may be not enough)	
+		ELSEIF RemainingRetries() > 2 THEN	
+			TPWrite hand_Chirality + " hand: #" + ValToStr(nTotalRetryNum+1-RemainingRetries()) + " retry to wait for ActionCompleted!";
+			RETRY;
+		! Finally, raise the error to programmer.	
+		ELSE
+			TPWrite hand_Chirality + " hand: Fail to wait for Action_Completed.";
+			Stop \AllMoveTasks;
+			retry;
+		ENDIF
+	ENDIF
+ENDIF
+
+ENDPROC
+
+PROC Hand_Jog (\switch Inward | switch Outward, \num maxPeriod )
+IF Present(Inward) THEN Hand_JogInward; RETURN; ENDIF
+IF Present(Outward) THEN Hand_JogOutward; ENDIF
+ENDPROC
+
+PROC Hand_close()
+Hand_SendCommand COMMAND_GOTOREADY;
+Hand_WaitForExpectedState STATE_READY;
+Hand_SendCommand COMMAND_JOGCLOSE;
+WaitTime 0.6;
+WaitUntil  Hand_GetActualSpd() < 1;
+ENDPROC
+
+
+PROC Hand_GripTest()
+Hand_SendCommand COMMAND_GOTOREADY;
+Hand_WaitForExpectedState STATE_READY;
+Hand_SendCommand COMMAND_JOGCLOSE;
+WaitTime 0.6;
+WaitUntil  Hand_GetActualSpd() < 1;
+ENDPROC
+! Jog the finger inward, with a time limit.
+PROC Hand_JogInward()
+VAR bool isJogToLimit := FALSE;
+Hand_SendCommand COMMAND_GOTOREADY;
+Hand_WaitForExpectedState STATE_READY;
+Hand_SendCommand COMMAND_JOGCLOSE;
+WaitTime 1;
+WaitUntil  Hand_GetActualSpd() < 10, \MaxTime := MAX_JOG_TIME, \TimeFlag := isJogToLimit;
+
+Hand_Stop;
+ENDPROC
+
+! Jog the finger outward, with a time limit.
+PROC Hand_JogOutward()
+VAR bool isJogToLimit := FALSE;
+Hand_SendCommand COMMAND_GOTOREADY;
+Hand_WaitForExpectedState STATE_READY;
+Hand_SendCommand COMMAND_JOGOPEN;
+WaitTime 1;
+WaitUntil  Hand_GetActualSpd() < 10, \MaxTime := MAX_JOG_TIME, \TimeFlag := isJogToLimit;
+
+Hand_Stop;
+ENDPROC
+
+
+PROC Hand_WaitActionCompleted ()
+Hand_WaitForExpectedState STATE_ACTIONCOMPLETED, \duration := 3;
+ENDPROC
+
+
+
+! Move the finger inward, with an optional target position setting.
+PROC Hand_MoveInward (\ num targetPosition, \switch NoWait)
+! Check whether calibrated.
+IF NOT HAND_IsCalibrated(\RaiseErr) THEN
+ENDIF
+
+IF Present(targetPosition) THEN
+Hand_SetMinPosition targetPosition;
+ENDIF
+
+IF Hand_GetActualPos() < GOutput(hand_MinPosition) THEN
+TPWrite "Warning! The target position is larger than the finger's current position.";
+! Todo: stop the execution, prompt the user to move the finger manually or use jog motion instead.
+RETURN;
+ELSE
+Hand_SendCommand COMMAND_GOTOREADY;
+Hand_WaitForExpectedState STATE_READY;
+Hand_SendCommand COMMAND_FREEMOVETOMINPOS;
+IF Present(NoWait) THEN
+	RETURN;
+ENDIF
+Hand_WaitForExpectedState STATE_ACTIONCOMPLETED;
+ENDIF
+ENDPROC
+
+! Move the finger outward, with an optional target position setting.
+PROC Hand_MoveOutward(\ num targetPosition, \switch NoWait)
+! Check whether calibrated.
+IF NOT HAND_IsCalibrated(\RaiseErr) THEN
+ENDIF
+
+IF Present(targetPosition) THEN
+	Hand_SetMaxPosition targetPosition;
+ENDIF
+
+IF Hand_GetActualPos() > GOutput(hand_MaxPosition) THEN
+	TPWrite "Warning! The target position is smaller than the finger's current position.";
+	! Todo: stop the execution, prompt the user to move the finger manually or use jog motion instead.
+	RETURN;
+ELSE
+	Hand_SendCommand COMMAND_GOTOREADY;
+	Hand_WaitForExpectedState STATE_READY;
+	Hand_SendCommand COMMAND_FREEMOVETOMAXPOS;
+	! Hand_WaitForExpectedState STATE_ACTIONCOMPLETED;
+	IF Present(NoWait) THEN
+		RETURN;
+	ENDIF
+	Hand_WaitForExpectedState STATE_ACTIONCOMPLETED;
+ENDIF
+ENDPROC
+
+! Move the finger to a designated position.
+PROC Hand_MoveTo (num targetPos \switch NoWait)
+VAR num currentPos := 0;
+VAR num originLimit := 0;
+
+currentPos := Hand_GetActualPos();
+
+IF currentPos > targetPos THEN
+	originLimit := GOutput(hand_MinPosition);
+	IF Present(NoWait) THEN
+		Hand_MoveInward \targetPosition := targetPos, \NoWait;
+	ELSE
+		Hand_MoveInward \targetPosition := targetPos;
+	ENDIF
+	Hand_SetMinPosition originLimit;
+ELSEIF currentPos < targetPos THEN
+	originLimit := GOutput(hand_MaxPosition);
+	IF Present(NoWait) THEN
+		Hand_MoveOutward \targetPosition := targetPos, \NoWait;
+	ELSE
+		Hand_MoveOutward \targetPosition := targetPos;
+	ENDIF
+	Hand_SetMaxPosition originLimit;
+ELSE
+	! No need to move the fingers.
+	RETURN;
+ENDIF
+ENDPROC
+
+! Grip the finger inward, with an optional target position and expected holding force setting.
+PROC Hand_GripInward(\ num targetPosition, \ num expectedForce)
+! Check whether calibrated.
+VAR clock myclock;
+VAR num t1;
+VAR num t2;
+VAR num t3;
+ClkReset myclock;
+
+
+IF NOT HAND_IsCalibrated(\RaiseErr) THEN
+ENDIF
+
+IF Present(targetPosition) THEN
+	Hand_SetMinPosition targetPosition;
+ENDIF
+
+IF Present(expectedForce) THEN
+	Hand_SetHoldForce expectedForce;
+ENDIF
+
+IF Hand_GetActualPos() < GOutput(hand_MinPosition) THEN
+	TPWrite "Warning! The target position is larger than the finger's current position.";
+	! Todo: stop the execution, prompt the user to move the finger manually or use jog motion instead.
+	RETURN;
+ELSE
+   
+	Hand_SendCommand COMMAND_GOTOREADY;
+	Hand_WaitForExpectedState STATE_READY;
+   ! ClkStart myclock;
+	Hand_SendCommand COMMAND_GRIPOUTWARDIN;  
+   ! Hand_WaitForExpectedState 4;
+	Hand_WaitForExpectedState STATE_ACTIONCOMPLETED;
+    
+	Hand_SendCommand COMMAND_FORCINGOUTWARDIN;
+   ! WaitGO Finger_Command_right,7;
+   ! t1:=ClkRead(myclock);
+   ! WaitGI Finger_State_Right,7;
+   ! t2:=ClkRead(myclock);
+   !Hand_WaitForExpectedState 7;
+   !t2:=ClkRead(myclock);
+	Hand_WaitForExpectedState STATE_KEEPOBJECT;
+   ! t3:=ClkRead(myclock);
+   ! ClkStop myclock;
+   ! TPWrite "t1="\Num:=t1;
+   ! TPWrite "t2="\Num:=t2;
+   ! TPWrite "t3="\Num:=t3;
+ENDIF
+ENDPROC
+
+! Grip the finger outward, with an optional target position and expected holding force setting.
+PROC Hand_GripOutward(\ num targetPosition, \ num expectedForce)
+! Check whether calibrated.
+IF NOT HAND_IsCalibrated(\RaiseErr) THEN
+ENDIF
+
+IF Present(targetPosition) THEN
+	Hand_SetMaxPosition targetPosition;
+ENDIF
+
+IF Present(expectedForce) THEN
+	Hand_SetHoldForce expectedForce;
+ENDIF
+
+IF Hand_GetActualPos() > GOutput(hand_MaxPosition) THEN
+	TPWrite "Warning! The target position is smaller than the finger's current position.";
+	! Todo: stop the execution, prompt the user to move the finger manually or use jog motion instead.
+	RETURN;
+ELSE
+	Hand_SendCommand COMMAND_GOTOREADY;
+	Hand_WaitForExpectedState STATE_READY;
+    
+	Hand_SendCommand COMMAND_GRIPINWARDOUT;
+	Hand_WaitForExpectedState STATE_ACTIONCOMPLETED;
+	Hand_SendCommand COMMAND_FORCINGINWARDOUT;
+	Hand_WaitForExpectedState STATE_KEEPOBJECT;
+ENDIF
+ENDPROC 
+
+PROC Hand_GripTo (num targetPos, \ num expectedForce)
+VAR num currentPos := 0;
+VAR num originLimit := 0;
+
+currentPos := Hand_GetActualPos();
+
+! If the gap is less than 5, regard it as no gripping direction assigned.
+IF Abs(currentPos - targetPos) < 5 THEN
+	TPWrite "No explicit gripping direction assigned!";
+	STOP;
+ENDIF
+
+IF currentPos > targetPos THEN
+	originLimit := GOutput(hand_MinPosition);
+	IF Present(expectedForce) THEN
+		Hand_GripInward \targetPosition := targetPos,\expectedForce := expectedForce;
+	ELSE
+		Hand_GripInward \targetPosition := targetPos;
+	ENDIF
+	Hand_SetMinPosition originLimit;	
+ELSEIF currentPos < targetPos THEN
+	originLimit := GOutput(hand_MaxPosition);
+	IF Present(expectedForce) THEN
+		Hand_GripOutward \targetPosition := targetPos, \expectedForce := expectedForce;
+	ELSE
+		Hand_GripOutward \targetPosition := targetPos;
+	ENDIF
+	Hand_SetMaxPosition originLimit;
+ENDIF
+ENDPROC
+
+PROC Hand_DoCalibrate ()
+Hand_JogInward;
+WaitTime 1;
+Hand_SendCommand COMMAND_GOTOREADY;
+Hand_WaitForExpectedState STATE_READY;
+Hand_SendCommand COMMAND_GOTOCALIBRATION;
+Hand_WaitForExpectedState STATE_ACTIONCOMPLETED;
+Hand_SendCommand COMMAND_GOTOREADY;
+ENDPROC
+
+PROC Hand_Stop ()
+Hand_SendCommand COMMAND_GOTOREADY;
+Hand_WaitForExpectedState STATE_READY;
+Hand_SendCommand 0;
+ENDPROC
+
+
+
+!Setters and Getters
+PROC Hand_SendCommand (num fingerCmdCode)
+Hand_SetupChirality;
+SetGO hand_FingerCommand, fingerCmdCode;
+ENDPROC	
+
+PROC Hand_SetMaxPosition (num maxPos)
+Hand_SetupChirality;
+SetGO hand_MaxPosition, maxPos;
+ENDPROC
+
+PROC Hand_SetMinPosition (num minPos)
+Hand_SetupChirality;
+SetGO hand_MinPosition, minPos;
+ENDPROC
+
+PROC Hand_SetMaxSpeed (num maxSpd)
+Hand_SetupChirality;
+SetGO hand_MaxSpeed, maxSpd;
+ENDPROC
+
+PROC Hand_SetAcc ()
+! ToDo
+ENDPROC
+
+PROC Hand_SetHoldForce (num holdForce)
+Hand_SetupChirality;
+SetGO hand_HoldForce, holdForce;
+!SetGO hand_HoldForce, 100;
+ENDPROC
+
+FUNC bool Hand_IsCalibrated ( \switch RaiseErr)
+Hand_SetupChirality;
+
+IF hand_Calibrated = 1 THEN
+	RETURN TRUE;
+ELSE
+	IF Present(RaiseErr) THEN
+		Raise ERR_HAND_NOTCALIBRATED;
+	ENDIF
+	RETURN FALSE;
+ENDIF
+
+ERROR
+IF ERRNO = ERR_HAND_NOTCALIBRATED THEN
+	! A more robust and sophisticated handler is in demanding.
+	TPWrite hand_Chirality + " hand is not calibrated!";
+	STOP;
+	ELSE
+	RaiseToUser \BreakOff;
+ENDIF
+ENDFUNC
+
+! Read feedback from finger
+FUNC num Hand_GetActualPos ()
+Hand_SetupChirality;
+RETURN hand_ActualPosition;
+ENDFUNC
+
+FUNC num Hand_GetActualSpd ()
+Hand_SetupChirality;
+RETURN hand_ActualSpeed;
+ENDFUNC
+
+FUNC num Hand_GetActualForce ()
+Hand_SetupChirality;
+RETURN hand_ActualForce;
+ENDFUNC
+
+FUNC num Hand_GetFingerState ()
+Hand_SetupChirality;
+RETURN GInput(hand_FingerState);
+ENDFUNC
+
+FUNC num Hand_GetFingerErrID ()
+Hand_SetupChirality;
+RETURN hand_FingerError;
+ENDFUNC
+
+
+! routines to control valves.
+PROC Hand_BlowOnCup1 ()
+Hand_SetupChirality;
+!Verify the vacuum on cup1 is off.
+IF cupStatus_SucTool1 = 1 THEN
+SetDO cupCtrl_SucTool1, 0;
+ENDIF
+SetDO cupCtrl_BlowTool1, 0;
+ENDPROC
+
+PROC Hand_BlowOnCup2 ()
+Hand_SetupChirality;
+!Verify the vacuum on cup1 is off.
+IF cupStatus_SucTool2 = 1 THEN
+SetDO cupCtrl_SucTool2, 0;
+ENDIF
+SetDO cupCtrl_BlowTool2, 0;
+ENDPROC
+
+PROC Hand_VacuumOnCup1 ()
+Hand_SetupChirality;
+!Verify the vacuum on cup1 is off.
+IF cupStatus_BlowTool1 = 1 THEN
+	SetDO cupCtrl_BlowTool1, 0;
+ENDIF
+SetDO cupCtrl_SucTool1, 0;
+ENDPROC
+
+PROC Hand_VacuumOnCup2 ()
+Hand_SetupChirality;
+!Verify the vacuum on cup1 is off.
+IF cupStatus_BlowTool2 = 1 THEN
+SetDO cupCtrl_BlowTool2, 0;
+ENDIF
+SetDO cupCtrl_SucTool2, 0;
+ENDPROC
+
+
+PROC Hand_SetupChirality ()
+VAR string config_io_string;
+
+VAR num listNum := 1;
+VAR string mechUnitName := "";
+VAR bool IsTwoArmsRob := FALSE;
+VAR byte HandConnectionStatus:=0;
+
+IF hand_IsChiralityDefined THEN
+	RETURN;
+ELSE
+	! Bool errnum
+	BookErrNo ERR_HAND_WRONG_STATE;
+	BookErrNo ERR_HAND_NOTCALIBRATED;
+	BookErrNo ERR_HAND_NOHAND;
+   IF GetNextMechUnit(listNum, mechUnitName) THEN
+		IF mechUnitName = "ROB_1_7" THEN
+			IsTwoArmsRob := TRUE; 
+        ELSE 
+            IsTwoArmsRob := False; 
+        endif
+   else
+       IsTwoArmsRob := False; 
+   endif
+   
+   if IOUnitState("Hand_Right", \Phys) = IOUNIT_PHYS_STATE_RUNNING THEN	
+       HandConnectionStatus:=1;
+   endif
+   IF IOUnitState("Hand_Left", \Phys) = IOUNIT_PHYS_STATE_RUNNING  THEN	
+       HandConnectionStatus:=HandConnectionStatus+2; 
+   endif
+   TEST HandConnectionStatus
+      CASE 1:                                 !only right hand connected             
+       IF IsTwoArmsRob THEN                   !When two arms robot case, T_ROB1 should be the controller of the right hand and T_ROB2 the left hand
+           IF GetTaskName()="T_ROB1" THEN 
+           hand_Chirality := "RIGHT";  
+           ELSE 
+               TPWrite "Only T_ROB1 could control the right hand.";
+               Stop;
+           ENDIF 
+       else
+          hand_Chirality := "RIGHT"; 
+       endif
+      CASE 2:                                 !only left hand connected    
+      IF IsTwoArmsRob THEN 
+           IF GetTaskName()="T_ROB2" THEN 
+           hand_Chirality := "LEFT";  
+           else 
+               TPWrite "Only T_ROB2 could control the left hand.";
+               Stop;
+           ENDIF 
+       else
+        hand_Chirality := "LEFT"; 
+      ENDIF 
+      CASE 3:                                 !both hands connected
+       IF GetTaskName()="T_ROB1" THEN              
+           hand_Chirality := "RIGHT"; 
+        elseif GetTaskName()="T_ROB2" THEN 
+           hand_Chirality := "LEFT";   
+       ELSE 
+            TPWrite "Only T_ROB1 and T_ROB2 could control the right hand and left hand!";
+            Stop;
+        ENDIF 
+      DEFAULT:                                !no hands connected  HandConnectionStatus=0
+          Raise ERR_HAND_NOHAND;
+   ENDTEST  
+	!Set alias IO for finger command.
+	config_io_string := "ActualPosition_" + hand_Chirality;
+	AliasIO config_io_string, hand_ActualPosition;
+	config_io_string := "ActualSpeed_" + hand_Chirality;
+	AliasIO config_io_string, hand_ActualSpeed;
+	config_io_string := "ActualForce_" + hand_Chirality;
+	AliasIO config_io_string, hand_ActualForce;
+	config_io_string := "Finger_State_" + hand_Chirality;
+	AliasIO config_io_string, hand_FingerState;
+	config_io_string := "Finger_Error_" + hand_Chirality;
+	AliasIO config_io_string, hand_FingerError;
+	config_io_string := "Software_Version_" + hand_Chirality;
+	AliasIO config_io_string, hand_SoftwareVersion;
+	config_io_string := "Finger_Command_" + hand_Chirality;
+	AliasIO config_io_string, hand_FingerCommand;
+	config_io_string := "Max_Position_" + hand_Chirality;
+	AliasIO config_io_string, hand_MaxPosition;
+	config_io_string := "Min_Position_" + hand_Chirality;
+	AliasIO config_io_string, hand_MinPosition;
+	config_io_string := "Max_Speed_" + hand_Chirality;
+	AliasIO config_io_string, hand_MaxSpeed;
+	config_io_string := "Hold_Force_" + hand_Chirality;
+	AliasIO config_io_string, hand_HoldForce;
+	config_io_string := "Calibrated_" + hand_Chirality;
+	AliasIO config_io_string, hand_Calibrated;
+	config_io_string := "Clear_Error_" + hand_Chirality;
+	AliasIO config_io_string, hand_ClearError;
+	
+	! Set alias IO for valves control.
+	config_io_string := "SuncTool_1_" + hand_Chirality;
+	AliasIO config_io_string, cupCtrl_SucTool1;
+	config_io_string := "SuncTool_2_" + hand_Chirality;
+	AliasIO config_io_string, cupCtrl_SucTool2;
+	config_io_string := "BlowOffTool_1_" + hand_Chirality;
+	AliasIO config_io_string, cupCtrl_BlowTool1;
+	config_io_string := "BlowOffTool_2_" + hand_Chirality;
+	AliasIO config_io_string, cupCtrl_BlowTool2;
+	config_io_string := "SuncTool_Status_1_" + hand_Chirality;
+	AliasIO config_io_string, cupStatus_SucTool1;	
+	config_io_string := "SuncTool_Status_2_" + hand_Chirality;
+	AliasIO config_io_string, cupStatus_SucTool2;	
+	config_io_string := "BlowTool_Status_1_" + hand_Chirality;
+	AliasIO config_io_string, cupStatus_BlowTool1;	
+	config_io_string := "BlowTool_Status_2_" + hand_Chirality;
+	AliasIO config_io_string, cupStatus_BlowTool2;			
+	
+	hand_IsChiralityDefined := TRUE;
+ENDIF
+
+ERROR
+IF ERRNO = ERR_HAND_NOHAND THEN
+	TPWrite "No hands connected! Please check the hand's connection";
+	STOP;
+ELSE
+	RaiseToUser \BreakOff;
+ENDIF
+	
+ENDPROC
+
+ENDMODULE

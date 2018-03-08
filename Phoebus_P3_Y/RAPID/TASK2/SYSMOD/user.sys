@@ -1,0 +1,37 @@
+
+
+MODULE user (SYSMODULE)
+
+ ! Predefined user data
+ !*********************
+
+ ! Declaration of numeric registers reg1...reg5
+ VAR num reg1 := 0;
+ VAR num reg2 := 0;
+ VAR num reg3 := 0;
+ VAR num reg4 := 0;
+ VAR num reg5 := 0;
+
+ ! Declaration of stopwatch clock1
+ VAR clock clock1;
+ CONST num ToolLeftOffX:=0.3;
+CONST num ToolLeftOffY:=0;
+CONST num ToolLeftOffZ:=0;
+
+ task PERS tooldata tool1 := [TRUE, [[0.212132,0.212132,128], [0.92388, 0, 0, 0.382683]],
+                        [0.001, [0, 0, 0.001],[0.92388, 0, 0, 0.382683], 0, 0, 0]];
+!tool1:44degree
+!task PERS tooldata tool1 := [TRUE, [[0, 0, 128], [0.927183855, 0, 0, 0.374606593]],
+                   !    [0.001, [0, 0, 0.001],[0.923879533, 0, 0, 0.382683432], 0, 0, 0]];
+ ! wobj1, user frame
+TASK PERS wobjdata wobj1:=[FALSE,TRUE,"",[[230.558,-20.9458,192.994],[0.999993,-0.000720221,-0.00211815,-0.00293994]],[[68.7872,6.8418,0],[0.994733,0,0,0.102498]]];
+!Base addition
+ Pers wobjdata WobjLeft:=[ FALSE, FALSE, "ROB_2", [ [0, 0, 0], [0.92388, 0, 0 ,0.382683] ], [ [0, 0, 127], [0.92388, 0, 0, -0.382683] ] ];
+Pers wobjdata WobjRight;
+!
+PERS tooldata toolLefthand := [ TRUE, [ [0.212132,0.212132, 128], [0.270598,-0.653282,-0.270598,-0.653282]], [0.001, [0, 0, 0.001], [1, 0, 0, 0], 0, 0, 0] ];   !cube permute tool parallel to WobjLeft.
+ PERS wobjdata wobjMulitMove:=[False,FALSE,"ROB_1",[[0,0,0],[1, 0, 0, 0]],[[0,0,0],[0.92388, 0, 0, 0.382683]]];
+PERS num RobState:=6;
+ TASK PERS wobjdata wobj_mid_l:=[FALSE,TRUE,"",[[0,0,0],[1,0,0,0]],[[0,0,0],[1,0,0,0]]];
+
+ENDMODULE
